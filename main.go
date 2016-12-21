@@ -4,26 +4,26 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"path/filepath"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"gopkg.in/alecthomas/kingpin.v2"
 	"github.com/rwcarlsen/goexif/exif"
 	"github.com/rwcarlsen/goexif/mknote"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 const (
-	version = "0.0.1"
-	dateTimeLayout = "2006-01-02_15-04-05"
+	version         = "0.0.1"
+	dateTimeLayout  = "2006-01-02_15-04-05"
 	duplicateSuffix = "-"
 )
 
 var (
-	debugFlag = kingpin.Flag("verbose", "Enable verbose output.").Short('v').Bool()
+	debugFlag  = kingpin.Flag("verbose", "Enable verbose output.").Short('v').Bool()
 	dryRunFlag = kingpin.Flag("dry-run", "Enable dry run mode.").Short('d').Bool()
-	dirArg    = kingpin.Arg("directory", "Directory to use.").Required().ExistingDir()
+	dirArg     = kingpin.Arg("directory", "Directory to use.").Required().ExistingDir()
 
 	pictureExtensionsWhitelist = map[string]bool{
 		".jpeg": true,
@@ -32,7 +32,6 @@ var (
 	}
 )
 
-
 type StringSet map[string]struct{}
 
 func newStringSet() StringSet {
@@ -40,8 +39,8 @@ func newStringSet() StringSet {
 }
 
 func (set *StringSet) Contains(s string) bool {
-	_, found := (*set)[s];
-	return found;
+	_, found := (*set)[s]
+	return found
 }
 
 func (set *StringSet) Add(s string) {
@@ -67,7 +66,7 @@ func (set *StringSet) Iter() <-chan interface{} {
 type PhotoRename struct {
 	OriginalFilename string
 	PhotoCaptureTime time.Time
-	RenamedFilename string
+	RenamedFilename  string
 }
 
 func (photoRename *PhotoRename) GetFormattedDateTime() string {
@@ -198,7 +197,7 @@ func main() {
 }
 
 func fileExists(filepath string) (bool, error) {
-	_, err := os.Stat(filepath);
+	_, err := os.Stat(filepath)
 
 	if err == nil {
 		return true, nil
