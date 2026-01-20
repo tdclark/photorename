@@ -1,34 +1,53 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"log"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/rwcarlsen/goexif/exif"
-	"github.com/rwcarlsen/goexif/mknote"
-	"gopkg.in/alecthomas/kingpin.v2"
+	"github.com/alecthomas/kong"
+	_ "github.com/dsoprea/go-exif/v3"
 )
 
 const (
-	version         = "0.0.1"
-	dateTimeLayout  = "2006-01-02_15-04-05"
-	duplicateSuffix = "-"
+	dateTimeLayout    = "2006-01-02_15-04-05"
+	duplicateSuffix   = "-"
+	metadataExtension = "xmp"
 )
 
 var (
-	debugFlag  = kingpin.Flag("verbose", "Enable verbose output.").Short('v').Bool()
-	dryRunFlag = kingpin.Flag("dry-run", "Enable dry run mode.").Short('d').Bool()
-	dirArg     = kingpin.Arg("directory", "Directory to use.").Required().ExistingDir()
+	parserFuncs = []func(string) (time.Time, error){
+		func(createDate string) (time.Time, error) {
+			return time.Parse("2006:01:02 15:04:05-07:00", createDate)
+		},
+		func(createDate string) (time.Time, error) {
+			dt, err := time.ParseInLocation("2006:01:02 15:04:05", createDate, time.Local)
+			if err == nil {
+				log.Printf("Parsed date %s in local timezone as it doesn't have a timezone\n", createDate)
+			}
+			return dt, err
+		},
+	}
+)
 
+type CliArgs struct {
+	DryRun bool
+	Dir    string `arg:"" type:"existingdir"`
+}
+
+var (
 	pictureExtensionsWhitelist = map[string]bool{
 		".jpeg": true,
 		".jpg":  true,
 		".cr2":  true,
+		".cr3":  true,
 	}
 )
 
@@ -111,52 +130,71 @@ func isPictureFile(filename string) bool {
 	return ok
 }
 
+type PhotoExifData struct {
+	CreateDate *string
+}
+
+func tryParseDateTime(createDate string) (time.Time, error) {
+	for _, f := range parserFuncs {
+		dt, err := f(createDate)
+		if err == nil {
+			return dt, nil
+		}
+	}
+	return time.Time{}, errors.New(fmt.Sprintf("error parsing create date %s", createDate))
+}
+
 func getPhotoDateTime(filepath string) (time.Time, error) {
-	f, err := os.Open(filepath)
+	cmd := exec.Command("exiftool", "-time:all", "-struct", "-j", filepath)
+	out, err := cmd.Output()
 	checkErr(err)
 
-	x, err := exif.Decode(f)
+	var data []PhotoExifData
+	err = json.Unmarshal(out, &data)
+	checkErr(err)
+
+	if len(data) == 0 || data[0].CreateDate == nil {
+		return time.Time{}, errors.New("no CreateDate available")
+	}
+
+	createDate := *data[0].CreateDate
+	log.Printf("Trying to parse create date %s for file %s\n", createDate, filepath)
+	dt, err := tryParseDateTime(createDate)
 	if err != nil {
 		return time.Time{}, err
 	}
-
-	t, err := x.DateTime()
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	return t, nil
+	log.Printf("Parsed create date as %s for file %s\n", createDate, filepath)
+	return dt, nil
 }
 
 func main() {
-	kingpin.Version(version)
-	kingpin.Parse()
+	args := &CliArgs{}
+	kong.Parse(args)
+	log.Printf("Args: %v\n", args)
 
-	directory, err := filepath.Abs(*dirArg)
+	directory, err := filepath.Abs(args.Dir)
 	checkErr(err)
 
-	fmt.Printf("Looking for files in directory: %s...\n", directory)
+	log.Printf("Looking for files in directory: %s...\n", directory)
 
-	fileInfos, err := ioutil.ReadDir(directory)
+	fileInfos, err := os.ReadDir(directory)
 	checkErr(err)
 
-	fmt.Println("Done.")
+	log.Println("Done.")
 
-	exif.RegisterParsers(mknote.All...)
-
-	// Gather all of the original files and set up the renames
+	// Gather all the original files and set up the renames
 	finalFilenames := newStringSet()
 	fileRenames := make([]*PhotoRename, 0)
 	for _, f := range fileInfos {
 		filename := f.Name()
-		filepath := filepath.Join(directory, filename)
+		fp := filepath.Join(directory, filename)
 
-		fmt.Printf("Processing '%s'.\n", filepath)
+		log.Printf("Processing %s...\n", fp)
 
 		if isPictureFile(filename) {
-			photoDateTime, err := getPhotoDateTime(filepath)
+			photoDateTime, err := getPhotoDateTime(fp)
 			if err != nil {
-				fmt.Printf("Failed to get datetime for '%s', '%v'\n", filepath, err)
+				log.Printf("Failed to get datetime for %s, %v\n", fp, err)
 				finalFilenames.Add(filename)
 				continue
 			}
@@ -164,7 +202,7 @@ func main() {
 			photoRename := newPhotoRename(filename, photoDateTime)
 
 			if photoRename.IsAlreadyFormatted() {
-				fmt.Printf("Photo '%s' already formatted.\n", filename)
+				log.Printf("Photo %s already formatted.\n", filename)
 				finalFilenames.Add(filename)
 			} else {
 				fileRenames = append(fileRenames, newPhotoRename(filename, photoDateTime))
@@ -187,12 +225,33 @@ func main() {
 		}
 	}
 
+	var metadataRenames = make([]*PhotoRename, 0)
 	for _, rename := range fileRenames {
-		processRename(rename, directory, *dryRunFlag)
-		if *dryRunFlag {
-		} else {
+		metadataFilename := fmt.Sprintf("%s.%s", getNameWithoutExtension(rename.OriginalFilename), metadataExtension)
+		metadataFilepath := filepath.Join(directory, metadataFilename)
+		exists, err := fileExists(metadataFilepath)
+		checkErr(err)
+		if exists {
+			newMetadataFilename := fmt.Sprintf("%s.%s", getNameWithoutExtension(rename.RenamedFilename), metadataExtension)
+			newMetadataFilepath := filepath.Join(directory, newMetadataFilename)
+			newMetadataExists, err := fileExists(newMetadataFilepath)
+			checkErr(err)
+			if newMetadataExists {
+				log.Fatalf("Metadata %s already exists\n", newMetadataFilepath)
+			}
 
+			metadataRename := newPhotoRename(metadataFilename, rename.PhotoCaptureTime)
+			metadataRename.RenamedFilename = newMetadataFilename
+			metadataRenames = append(metadataRenames, metadataRename)
 		}
+	}
+	fileRenames = append(fileRenames, metadataRenames...)
+
+	for _, rename := range fileRenames {
+		if len(rename.RenamedFilename) == 0 {
+			panic(fmt.Sprintf("Invalid rename '%v'", rename))
+		}
+		processRename(rename, directory, args.DryRun)
 	}
 }
 
@@ -211,9 +270,6 @@ func fileExists(filepath string) (bool, error) {
 }
 
 func processRename(rename *PhotoRename, directory string, dryRun bool) {
-	if len(rename.RenamedFilename) == 0 {
-		panic(fmt.Sprintf("Renamed filename is empty for '%v'", rename.RenamedFilename))
-	}
 
 	oldPath := filepath.Join(directory, rename.OriginalFilename)
 	newPath := filepath.Join(directory, rename.RenamedFilename)
@@ -226,10 +282,10 @@ func processRename(rename *PhotoRename, directory string, dryRun bool) {
 	}
 
 	if dryRun {
-		fmt.Printf("DRY RUN: Would be renaming '%s' to '%s'\n", oldPath, newPath)
+		log.Printf("DRY RUN: Would be renaming %s to %s\n", oldPath, newPath)
 	} else {
-		fmt.Printf("Renaming '%s' to '%s'\n", oldPath, newPath)
-		os.Rename(oldPath, newPath)
+		log.Printf("Renaming %s to %s\n", oldPath, newPath)
+		err = os.Rename(oldPath, newPath)
 	}
 }
 
